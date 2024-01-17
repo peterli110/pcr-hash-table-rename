@@ -1,2 +1,7 @@
 /.idea/
 .DS_Store
+jp_fixed.db
+pcr_hash_rename_tool_darwin_arm64
+pcr_hash_rename_tool_linux_amd64
+pcr_hash_rename_tool_windows_amd64.exe
+table_mapping.json
