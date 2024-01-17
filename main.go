@@ -70,7 +70,7 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 	defer newDB.Close()
 
 	for t, v := range originalDBMap {
-		if hashedTable, ok := findMatchingTable(v); ok {
+		if hashedTable, ok := findMatchingTable(v, hashedDB, t); ok {
 			tableMapping[t] = hashedTable
 			copyData(originalDB, hashedDB, newDB, t, hashedTable)
 		} else {
@@ -125,7 +125,7 @@ func getTableNames(db *sql.DB, filterV1Tables bool) []string {
 	return tables
 }
 
-func findMatchingTable(values [][]string) (string, bool) {
+func findMatchingTable(values [][]string, hashedDB *sql.DB, table string) (string, bool) {
 	if len(values) == 0 {
 		return "", false
 	}
@@ -134,6 +134,14 @@ func findMatchingTable(values [][]string) (string, bool) {
 			continue
 		}
 		if compareData(values, v) {
+			// these 2 tables have the same data but different number of rows
+			// looks like unit_unique_equip is deprecated and there are only 183 rows
+			if table == "unit_unique_equipment" || table == "unit_unique_equip" {
+				rowsCount := countRowsInTable(hashedDB, t)
+				if (table == "unit_unique_equipment" && rowsCount < 200) || (table == "unit_unique_equip" && rowsCount > 200) {
+					continue
+				}
+			}
 			return t, true
 		}
 	}
@@ -253,6 +261,17 @@ func getAllData(db *sql.DB, tableName string) ([][]string, error) {
 	}
 
 	return tableData, nil
+}
+
+func countRowsInTable(db *sql.DB, tableName string) int {
+	var count int
+
+	err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&count)
+	if err != nil {
+		log.Fatalf("Error counting rows in table %s: %v", tableName, err)
+	}
+
+	return count
 }
 
 func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
