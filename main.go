@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,12 +15,13 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var originalDBPath, hashedDBPath, generatedDBPath string
+var originalDBPath, hashedDBPath, generatedDBPath, filter string
 var generateHashJson bool
 
 var originalDBMap = map[string][][]string{}
 var hashedDBMap = map[string][][]string{}
 var tableMapping = map[string]string{}
+var filterTables = map[string]struct{}{}
 
 var numericRegex = regexp.MustCompile(`^\d+(\.\d+)?$`)
 
@@ -38,6 +40,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVarP(&hashedDBPath, "hashedDBPath", "n", "", "REQUIRED: Path to the hashed (latest) database")
 	rootCmd.PersistentFlags().StringVarP(&generatedDBPath, "generatedDBPath", "g", "jp_fixed.db", "OPTIONAL: Path to the new database, default to jp_fixed.db")
 	rootCmd.PersistentFlags().BoolVarP(&generateHashJson, "generateTableMapping", "t", false, "OPTIONAL: Generate a mapping of raw table name -> hash table name in JSON")
+	rootCmd.PersistentFlags().StringVarP(&filter, "filter", "f", "", "OPTIONAL: Use a file to generate a new database with only the tables in the file")
 	_ = rootCmd.MarkPersistentFlagRequired("originalDBPath")
 	_ = rootCmd.MarkPersistentFlagRequired("hashedDBPath")
 
@@ -48,6 +51,9 @@ func main() {
 }
 
 func run(originalDBPath string, hashedDBPath string, generatedDBPath string, generateHashJson bool) {
+	if filter != "" {
+		readFilterFile()
+	}
 	originalDB, err := sql.Open("sqlite3", originalDBPath)
 	if err != nil {
 		log.Fatal(err)
@@ -70,6 +76,11 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 	defer newDB.Close()
 
 	for t, v := range originalDBMap {
+		if filter != "" {
+			if _, ok := filterTables[t]; !ok {
+				continue
+			}
+		}
 		if hashedTable, ok := findMatchingTable(v, hashedDB, t); ok {
 			tableMapping[t] = hashedTable
 			copyData(originalDB, hashedDB, newDB, t, hashedTable)
@@ -325,5 +336,25 @@ func writeJson() {
 	_, err = file.Write(jsonData)
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+func readFilterFile() {
+	file, err := os.Open(filter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if text != "" {
+			filterTables[text] = struct{}{}
+		}
+	}
+
+	if err = scanner.Err(); err != nil {
+		log.Fatalf("Error reading filter file: %v", err)
 	}
 }

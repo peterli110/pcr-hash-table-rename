@@ -19,6 +19,7 @@ Usage:
   pcr-hash-table-rename [flags]
 
 Flags:
+  -f, --filter string            OPTIONAL: Use a file to generate a new database with only the tables in the file
   -t, --generateTableMapping     OPTIONAL: Generate a mapping of raw table name -> hash table name in JSON
   -g, --generatedDBPath string   OPTIONAL: Path to the new database, default to jp_fixed.db (default "jp_fixed.db")
   -n, --hashedDBPath string      REQUIRED: Path to the hashed (latest) database
