@@ -75,6 +75,12 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 	}
 	defer newDB.Close()
 
+	// using WAL mode to speed up insertions
+	_, err = newDB.Exec("PRAGMA journal_mode = WAL;")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	for t, v := range originalDBMap {
 		if filter != "" {
 			if _, ok := filterTables[t]; !ok {
@@ -229,13 +235,22 @@ func copyData(originalDB, hashedDB, newDB *sql.DB, origTable, hashedTable string
 	}
 
 	// copy data row by row to the new table
+	tx, err := newDB.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
 	for _, row := range hashedData {
 		insertStmt := createInsertStatement(origTable, row)
 		log.Println(insertStmt)
-		_, err = newDB.Exec(insertStmt)
+		_, err = tx.Exec(insertStmt)
 		if err != nil {
+			tx.Rollback()
 			log.Fatalf("Error inserting data into new table:", err)
 		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Fatal(err)
 	}
 }
 
