@@ -1,4 +1,0 @@
-unit_data
-unit_rarity
-unit_skill_data
-unit_unique_equipment
