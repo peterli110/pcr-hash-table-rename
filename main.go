@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"os"
@@ -427,18 +428,54 @@ func tryFingerprintMatch(orig *TableInfo, candidates []*TableInfo, origDB, hashD
 	return nil
 }
 
+// ColumnInfo holds metadata for a single column from PRAGMA table_info.
+type ColumnInfo struct {
+	Name    string
+	Type    string // INTEGER, REAL, TEXT, etc.
+	PKIndex int    // 0 = not PK, 1+ = composite PK position
+}
+
+// getColumnInfo returns full column metadata from PRAGMA table_info.
+func getColumnInfo(db *sql.DB, tableName string) []ColumnInfo {
+	query := fmt.Sprintf("PRAGMA table_info([%s])", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		log.Fatalf("Error getting column info for table %s: %v", tableName, err)
+	}
+	defer rows.Close()
+
+	var infos []ColumnInfo
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue *string
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			log.Fatalf("Error scanning PRAGMA table_info for %s: %v", tableName, err)
+		}
+		infos = append(infos, ColumnInfo{Name: name, Type: strings.ToUpper(colType), PKIndex: pk})
+	}
+	return infos
+}
+
 // inferColumnMapping determines which hashed column maps to which original column.
 // Returns a slice where result[origIdx] = hashedIdx.
+//
+// Rows of the two tables are aligned first (joined on primary key values when a
+// usable PK exists, positionally otherwise), then columns are matched on their
+// full value vectors over the aligned rows. Comparing full vectors instead of a
+// fixed-size prefix matters: many columns are identical for the first few
+// hundred rows and only diverge later, so a prefix sample assigns them
+// arbitrarily and scrambles the copied data.
 func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []int {
-	n := 200
-	origRows := getFirstNRows(origDB, origTable, n)
-	hashRows := getFirstNRows(hashDB, hashTable, n)
+	origInfo := getColumnInfo(origDB, origTable)
+	hashInfo := getColumnInfo(hashDB, hashTable)
 
-	origColCount := getColumnCount(origDB, origTable)
-	hashColCount := getColumnCount(hashDB, hashTable)
+	origColCount := len(origInfo)
+	hashColCount := len(hashInfo)
 
 	if origColCount != hashColCount {
-		// Fallback: identity mapping (shouldn't happen after column count pre-filter)
 		mapping := make([]int, origColCount)
 		for i := range mapping {
 			mapping[i] = i
@@ -451,84 +488,220 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 	for i := range mapping {
 		mapping[i] = -1
 	}
-
 	usedHash := make([]bool, colCount)
 
-	// Build column value vectors
-	origCols := buildColumnVectors(origRows, colCount)
-	hashCols := buildColumnVectors(hashRows, colCount)
-
-	// Exact match on value vectors
-	for i := 0; i < colCount; i++ {
-		if mapping[i] != -1 {
-			continue
-		}
-		for j := 0; j < colCount; j++ {
-			if usedHash[j] {
-				continue
-			}
-			if strSliceEqual(origCols[i], hashCols[j]) {
-				mapping[i] = j
-				usedHash[j] = true
-				break
-			}
+	// Pass 0: Match PRIMARY KEY columns by pk number (not position)
+	origPKByNum := make(map[int]int) // pk_number -> column_index
+	hashPKByNum := make(map[int]int)
+	for i, ci := range origInfo {
+		if ci.PKIndex > 0 {
+			origPKByNum[ci.PKIndex] = i
 		}
 	}
-
-	// Statistical match using Jaccard on value frequency maps
-	for i := 0; i < colCount; i++ {
-		if mapping[i] != -1 {
-			continue
-		}
-		origFreq := buildFreqMap(origCols[i])
-		bestJ := -1
-		bestSim := 0.3 // minimum threshold
-
-		for j := 0; j < colCount; j++ {
-			if usedHash[j] {
-				continue
-			}
-			hashFreq := buildFreqMap(hashCols[j])
-			sim := jaccardSimilarity(origFreq, hashFreq)
-			if sim > bestSim {
-				bestSim = sim
-				bestJ = j
-			}
-		}
-
-		if bestJ >= 0 {
-			mapping[i] = bestJ
-			usedHash[bestJ] = true
+	for j, ci := range hashInfo {
+		if ci.PKIndex > 0 {
+			hashPKByNum[ci.PKIndex] = j
 		}
 	}
+	var pkPairs [][2]int // (origIdx, hashIdx) per PK column, ordered by pk number
+	for pkNum := 1; pkNum <= colCount; pkNum++ {
+		origIdx, okOrig := origPKByNum[pkNum]
+		hashIdx, okHash := hashPKByNum[pkNum]
+		if okOrig && okHash {
+			mapping[origIdx] = hashIdx
+			usedHash[hashIdx] = true
+			pkPairs = append(pkPairs, [2]int{origIdx, hashIdx})
+		}
+	}
+	pkUsable := len(pkPairs) > 0 &&
+		len(pkPairs) == len(origPKByNum) && len(pkPairs) == len(hashPKByNum)
 
-	// Elimination — if exactly 1 unmapped remains on each side
-	unmappedOrig := []int{}
-	unmappedHash := []int{}
+	origRows := getAllRows(origDB, origTable)
+	hashRows := getAllRows(hashDB, hashTable)
+	origAligned, hashAligned := alignRows(origRows, hashRows, pkPairs, pkUsable)
+
+	origCols := buildColumnVectors(origAligned, colCount)
+	hashCols := buildColumnVectors(hashAligned, colCount)
+
+	// Pass 1: exact vector equality, grouped by (type, vector digest). Columns
+	// inside one group hold identical values on every aligned row, so pairing
+	// order within a group cannot affect the copied data.
+	type colGroup struct {
+		colType string
+		digest  uint64
+	}
+	origGroups := make(map[colGroup][]int)
+	hashGroups := make(map[colGroup][]int)
 	for i := 0; i < colCount; i++ {
 		if mapping[i] == -1 {
-			unmappedOrig = append(unmappedOrig, i)
+			key := colGroup{origInfo[i].Type, hashVector(origCols[i])}
+			origGroups[key] = append(origGroups[key], i)
 		}
 	}
 	for j := 0; j < colCount; j++ {
 		if !usedHash[j] {
-			unmappedHash = append(unmappedHash, j)
+			key := colGroup{hashInfo[j].Type, hashVector(hashCols[j])}
+			hashGroups[key] = append(hashGroups[key], j)
 		}
 	}
-	if len(unmappedOrig) == len(unmappedHash) {
-		for k := range unmappedOrig {
-			mapping[unmappedOrig[k]] = unmappedHash[k]
+	for key, origIdxs := range origGroups {
+		hashIdxs := hashGroups[key]
+		if len(hashIdxs) == 0 {
+			continue
+		}
+		// guard against a digest collision producing a false group match
+		if !strSliceEqual(origCols[origIdxs[0]], hashCols[hashIdxs[0]]) {
+			continue
+		}
+		n := len(origIdxs)
+		if len(hashIdxs) < n {
+			n = len(hashIdxs)
+		}
+		for k := 0; k < n; k++ {
+			mapping[origIdxs[k]] = hashIdxs[k]
+			usedHash[hashIdxs[k]] = true
 		}
 	}
 
-	// Final fallback: any still unmapped get identity mapping
+	// Pass 2: leftovers (columns whose data changed between the two DB
+	// versions) are assigned greedily by lowest mismatch count over the aligned
+	// rows, type-constrained first, then unconstrained.
+	for _, typeConstrained := range []bool{true, false} {
+		type colPair struct {
+			origIdx, hashIdx, mismatches int
+		}
+		var pairs []colPair
+		for i := 0; i < colCount; i++ {
+			if mapping[i] != -1 {
+				continue
+			}
+			for j := 0; j < colCount; j++ {
+				if usedHash[j] {
+					continue
+				}
+				if typeConstrained && origInfo[i].Type != hashInfo[j].Type {
+					continue
+				}
+				pairs = append(pairs, colPair{i, j, countMismatches(origCols[i], hashCols[j])})
+			}
+		}
+		sort.Slice(pairs, func(a, b int) bool {
+			if pairs[a].mismatches != pairs[b].mismatches {
+				return pairs[a].mismatches < pairs[b].mismatches
+			}
+			if pairs[a].origIdx != pairs[b].origIdx {
+				return pairs[a].origIdx < pairs[b].origIdx
+			}
+			return pairs[a].hashIdx < pairs[b].hashIdx
+		})
+		for _, p := range pairs {
+			if mapping[p.origIdx] != -1 || usedHash[p.hashIdx] {
+				continue
+			}
+			mapping[p.origIdx] = p.hashIdx
+			usedHash[p.hashIdx] = true
+		}
+	}
+
+	// Final fallback: any still unmapped
 	for i := range mapping {
 		if mapping[i] == -1 {
-			mapping[i] = i
+			for j := 0; j < colCount; j++ {
+				if !usedHash[j] {
+					mapping[i] = j
+					usedHash[j] = true
+					break
+				}
+			}
 		}
 	}
 
 	return mapping
+}
+
+// alignRows pairs rows of the original and hashed tables so their columns can
+// be compared value-by-value. When a usable primary key exists, rows are
+// joined on their PK values; a positional pairing (keeping only positions
+// where both rows hold the same multiset of values) is the fallback, and wins
+// whenever it aligns more rows than the PK join managed.
+func alignRows(origRows, hashRows [][]string, pkPairs [][2]int, pkUsable bool) ([][]string, [][]string) {
+	var origByPK, hashByPK [][]string
+	if pkUsable {
+		index := make(map[string][]string, len(hashRows))
+		for _, hr := range hashRows {
+			index[pkKey(hr, pkPairs, 1)] = hr
+		}
+		for _, or := range origRows {
+			if hr, ok := index[pkKey(or, pkPairs, 0)]; ok {
+				origByPK = append(origByPK, or)
+				hashByPK = append(hashByPK, hr)
+			}
+		}
+		if len(origByPK)*2 >= len(origRows) {
+			return origByPK, hashByPK
+		}
+	}
+
+	var origByPos, hashByPos [][]string
+	n := len(origRows)
+	if len(hashRows) < n {
+		n = len(hashRows)
+	}
+	for i := 0; i < n; i++ {
+		sortedOrig := make([]string, len(origRows[i]))
+		copy(sortedOrig, origRows[i])
+		sort.Strings(sortedOrig)
+		sortedHash := make([]string, len(hashRows[i]))
+		copy(sortedHash, hashRows[i])
+		sort.Strings(sortedHash)
+		if strSliceEqual(sortedOrig, sortedHash) {
+			origByPos = append(origByPos, origRows[i])
+			hashByPos = append(hashByPos, hashRows[i])
+		}
+	}
+
+	if len(origByPK) > len(origByPos) {
+		return origByPK, hashByPK
+	}
+	return origByPos, hashByPos
+}
+
+// pkKey builds a row's join key from its primary key values.
+// side selects the original (0) or hashed (1) column index of each PK pair.
+func pkKey(row []string, pkPairs [][2]int, side int) string {
+	var b strings.Builder
+	for _, p := range pkPairs {
+		if idx := p[side]; idx < len(row) {
+			b.WriteString(row[idx])
+		}
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// hashVector produces a digest of a column's values for exact-equality grouping.
+func hashVector(values []string) uint64 {
+	h := fnv.New64a()
+	for _, v := range values {
+		h.Write([]byte(v))
+		h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
+// countMismatches counts positions where the two aligned vectors differ.
+func countMismatches(a, b []string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	count := 0
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			count++
+		}
+	}
+	return count
 }
 
 // buildColumnVectors transposes row data into per-column value slices.
@@ -543,15 +716,6 @@ func buildColumnVectors(rows [][]string, colCount int) [][]string {
 		}
 	}
 	return cols
-}
-
-// buildFreqMap creates a frequency map from a slice of strings.
-func buildFreqMap(values []string) map[string]int {
-	freq := make(map[string]int)
-	for _, v := range values {
-		freq[v]++
-	}
-	return freq
 }
 
 func copyData(originalDB, hashedDB, newDB *sql.DB, origTable, hashedTable string, colMapping []int) {
@@ -708,7 +872,15 @@ func getColumnNames(db *sql.DB, tableName string) []string {
 }
 
 func getFirstNRows(db *sql.DB, tableName string, n int) [][]string {
-	query := fmt.Sprintf("SELECT * FROM [%s] LIMIT %d", tableName, n)
+	return queryRowsAsStrings(db, fmt.Sprintf("SELECT * FROM [%s] LIMIT %d", tableName, n), tableName)
+}
+
+// getAllRows fetches every row of a table with values rendered as strings.
+func getAllRows(db *sql.DB, tableName string) [][]string {
+	return queryRowsAsStrings(db, fmt.Sprintf("SELECT * FROM [%s]", tableName), tableName)
+}
+
+func queryRowsAsStrings(db *sql.DB, query, tableName string) [][]string {
 	rows, err := db.Query(query)
 	if err != nil {
 		log.Fatalf("Error querying database in table %s: %v", tableName, err)
