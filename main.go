@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"math"
 	"os"
 	"sort"
 	"strings"
@@ -31,13 +30,21 @@ type TableInfo struct {
 }
 
 // MatchResult records a successful match between an original and hashed table,
-// including the column index mapping (origIdx -> hashedIdx).
+// including the column mapping.
 type MatchResult struct {
-	OrigTable     string
-	HashedTable   string
-	ColumnMapping []int
-	Strategy      int // which strategy matched (1, 2, or 3)
+	OrigTable   string
+	HashedTable string
+	Columns     columnMapping
+	Strategy    int // which strategy matched (1, 2, or 3)
 }
+
+// minAlignedFraction is the share of original rows that must align with rows
+// of the hashed table for a fuzzy match (strategy 2/3, or any match against a
+// wider table) to be accepted. A wrong table rarely shares more than a few
+// percent of its primary keys, while a real table keeps most of its rows
+// between versions (the worst legit case seen so far, a rank-release row
+// shift, kept 50%).
+const minAlignedFraction = 0.2
 
 func main() {
 	var rootCmd = &cobra.Command{
@@ -101,7 +108,7 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 	}
 
 	matchedByStrategy := map[int]int{1: 0, 2: 0, 3: 0}
-	var unmatched []string
+	var unmatched, widened []string
 	usedHashedTables := map[string]bool{}
 
 	for _, orig := range originalTables {
@@ -117,24 +124,28 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 			continue
 		}
 
-		// Pre-filter: candidates with same column count, not already used
-		candidates := make([]*TableInfo, 0)
-		for _, c := range hashedTableIndex[orig.ColumnCount] {
-			if !usedHashedTables[c.Name] {
-				candidates = append(candidates, c)
-			}
-		}
+		// Pre-filter: unclaimed candidates with the same column count. When
+		// none of them matches, fall back to wider tables: the game added
+		// columns to the table since the original DB was made.
+		sameWidth := unclaimedCandidates(hashedTableIndex, usedHashedTables, orig.ColumnCount, false)
+		wider := unclaimedCandidates(hashedTableIndex, usedHashedTables, orig.ColumnCount, true)
 
-		if len(candidates) == 0 {
+		if len(sameWidth) == 0 && len(wider) == 0 {
 			unmatched = append(unmatched, orig.Name)
-			log.Printf("[FAIL] %s: no candidates with %d columns", orig.Name, orig.ColumnCount)
+			log.Printf("[FAIL] %s: no candidates with at least %d columns", orig.Name, orig.ColumnCount)
 			continue
 		}
 
-		result := matchTable(orig, candidates, originalDB, hashedDB)
+		var result *MatchResult
+		if len(sameWidth) > 0 {
+			result = matchTable(orig, sameWidth, originalDB, hashedDB, false)
+		}
+		if result == nil && len(wider) > 0 {
+			result = matchTable(orig, wider, originalDB, hashedDB, true)
+		}
 		if result == nil {
 			unmatched = append(unmatched, orig.Name)
-			log.Printf("[FAIL] %s: no match found among %d candidates", orig.Name, len(candidates))
+			log.Printf("[FAIL] %s: no match found among %d candidates", orig.Name, len(sameWidth)+len(wider))
 			continue
 		}
 
@@ -142,8 +153,14 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 		usedHashedTables[result.HashedTable] = true
 		tableMapping[result.OrigTable] = result.HashedTable
 
-		log.Printf("[strategy %d] %s -> %s", result.Strategy, result.OrigTable, result.HashedTable)
-		copyData(originalDB, hashedDB, newDB, result.OrigTable, result.HashedTable, result.ColumnMapping)
+		if n := len(result.Columns.Extra); n > 0 {
+			widened = append(widened, orig.Name)
+			log.Printf("[strategy %d] %s -> %s (+%d new columns appended under their hashed names)",
+				result.Strategy, result.OrigTable, result.HashedTable, n)
+		} else {
+			log.Printf("[strategy %d] %s -> %s", result.Strategy, result.OrigTable, result.HashedTable)
+		}
+		copyData(originalDB, hashedDB, newDB, result.OrigTable, result.HashedTable, result.Columns)
 	}
 
 	log.Printf("=== Summary ===")
@@ -151,6 +168,9 @@ func run(originalDBPath string, hashedDBPath string, generatedDBPath string, gen
 		matchedByStrategy[1], matchedByStrategy[2], matchedByStrategy[3],
 		matchedByStrategy[1]+matchedByStrategy[2]+matchedByStrategy[3],
 		len(originalTables))
+	if len(widened) > 0 {
+		log.Printf("Tables with new columns appended (%d): %s", len(widened), strings.Join(widened, ", "))
+	}
 	if len(unmatched) > 0 {
 		log.Printf("Unmatched (%d): %s", len(unmatched), strings.Join(unmatched, ", "))
 	}
@@ -193,61 +213,84 @@ func buildColumnCountIndex(tables []*TableInfo) map[int][]*TableInfo {
 	return index
 }
 
-// matchTable runs the 3-strategy cascade to find the best match for an original table.
-func matchTable(orig *TableInfo, candidates []*TableInfo, origDB, hashDB *sql.DB) *MatchResult {
-	// Strategy 1: Sorted Row Comparison (N=3)
-	matched := trySortedRowMatch(orig, candidates)
-	if len(matched) == 1 {
-		colMapping := inferColumnMapping(origDB, hashDB, orig.Name, matched[0].Name)
-		return &MatchResult{
-			OrigTable:     orig.Name,
-			HashedTable:   matched[0].Name,
-			ColumnMapping: colMapping,
-			Strategy:      1,
+// unclaimedCandidates returns the hashed tables not yet claimed by another
+// original table, either with exactly colCount columns or (wider) with more.
+// Candidates come out ordered by column count, then in database order.
+func unclaimedCandidates(index map[int][]*TableInfo, used map[string]bool, colCount int, wider bool) []*TableInfo {
+	counts := make([]int, 0, len(index))
+	for n := range index {
+		if (wider && n > colCount) || (!wider && n == colCount) {
+			counts = append(counts, n)
 		}
 	}
-	if len(matched) > 1 {
-		// Disambiguate by closest row count
-		best := disambiguateByRowCount(orig, matched)
-		if best != nil {
-			colMapping := inferColumnMapping(origDB, hashDB, orig.Name, best.Name)
-			return &MatchResult{
-				OrigTable:     orig.Name,
-				HashedTable:   best.Name,
-				ColumnMapping: colMapping,
-				Strategy:      1,
+	sort.Ints(counts)
+
+	var candidates []*TableInfo
+	for _, n := range counts {
+		for _, c := range index[n] {
+			if !used[c.Name] {
+				candidates = append(candidates, c)
 			}
+		}
+	}
+	return candidates
+}
+
+// matchTable runs the 3-strategy cascade to find the best match for an
+// original table among candidates. With wider set, the candidates have more
+// columns than the original table (rows are compared by containment instead
+// of equality) and every strategy is gated on row alignment; otherwise only
+// the fuzzy strategies 2 and 3 are gated.
+func matchTable(orig *TableInfo, candidates []*TableInfo, origDB, hashDB *sql.DB, wider bool) *MatchResult {
+	// Strategy 1: Sorted Row Comparison (N=3)
+	if matched := trySortedRowMatch(orig, candidates); len(matched) > 0 {
+		best := disambiguate(orig, matched)
+		if result := acceptMatch(orig, best, 1, wider, origDB, hashDB); result != nil {
+			return result
 		}
 	}
 
 	// Strategy 2: Multiset Similarity (N=10)
-	bestCandidate, bestScore := tryMultisetMatch(orig, candidates, hashDB)
+	bestCandidate, bestScore := tryMultisetMatch(orig, candidates)
 	if bestCandidate != nil && bestScore >= 0.5 {
-		colMapping := inferColumnMapping(origDB, hashDB, orig.Name, bestCandidate.Name)
-		return &MatchResult{
-			OrigTable:     orig.Name,
-			HashedTable:   bestCandidate.Name,
-			ColumnMapping: colMapping,
-			Strategy:      2,
+		if result := acceptMatch(orig, bestCandidate, 2, true, origDB, hashDB); result != nil {
+			return result
 		}
 	}
 
 	// Strategy 3: Unique Value Fingerprinting
-	fpMatch := tryFingerprintMatch(orig, candidates, origDB, hashDB)
-	if fpMatch != nil {
-		colMapping := inferColumnMapping(origDB, hashDB, orig.Name, fpMatch.Name)
-		return &MatchResult{
-			OrigTable:     orig.Name,
-			HashedTable:   fpMatch.Name,
-			ColumnMapping: colMapping,
-			Strategy:      3,
+	if fpMatch := tryFingerprintMatch(orig, candidates, origDB, hashDB); fpMatch != nil {
+		if result := acceptMatch(orig, fpMatch, 3, true, origDB, hashDB); result != nil {
+			return result
 		}
 	}
 
 	return nil
 }
 
+// acceptMatch infers the column mapping for a candidate and, when gated,
+// rejects the candidate unless enough original rows align with its rows.
+func acceptMatch(orig, cand *TableInfo, strategy int, gated bool, origDB, hashDB *sql.DB) *MatchResult {
+	columns := inferColumnMapping(origDB, hashDB, orig.Name, cand.Name)
+	if gated && orig.RowCount > 0 {
+		aligned := float64(columns.AlignedRows) / float64(orig.RowCount)
+		if aligned < minAlignedFraction {
+			log.Printf("[reject] %s -> %s (strategy %d): only %.1f%% of original rows align",
+				orig.Name, cand.Name, strategy, aligned*100)
+			return nil
+		}
+	}
+	return &MatchResult{
+		OrigTable:   orig.Name,
+		HashedTable: cand.Name,
+		Columns:     columns,
+		Strategy:    strategy,
+	}
+}
+
 // trySortedRowMatch compares first 3 rows with values sorted within each row.
+// A candidate row matches when it contains every value of the original row,
+// which for a candidate with the same column count is plain equality.
 func trySortedRowMatch(orig *TableInfo, candidates []*TableInfo) []*TableInfo {
 	n := 3
 	origSorted := sortedRows(orig.FirstNRows, n)
@@ -263,7 +306,7 @@ func trySortedRowMatch(orig *TableInfo, candidates []*TableInfo) []*TableInfo {
 		}
 		allMatch := true
 		for i := range origSorted {
-			if !strSliceEqual(origSorted[i], candSorted[i]) {
+			if !sortedRowContains(candSorted[i], origSorted[i]) {
 				allMatch = false
 				break
 			}
@@ -273,6 +316,25 @@ func trySortedRowMatch(orig *TableInfo, candidates []*TableInfo) []*TableInfo {
 		}
 	}
 	return matched
+}
+
+// sortedRowContains reports whether the sorted multiset super holds every
+// value of the sorted multiset sub (with multiplicity).
+func sortedRowContains(super, sub []string) bool {
+	if len(sub) > len(super) {
+		return false
+	}
+	j := 0
+	for _, v := range sub {
+		for j < len(super) && super[j] < v {
+			j++
+		}
+		if j == len(super) || super[j] != v {
+			return false
+		}
+		j++
+	}
+	return true
 }
 
 // sortedRows takes up to n rows and returns each row with values sorted.
@@ -291,25 +353,33 @@ func sortedRows(rows [][]string, n int) [][]string {
 	return result
 }
 
-// disambiguateByRowCount picks the candidate with the closest row count.
-func disambiguateByRowCount(orig *TableInfo, candidates []*TableInfo) *TableInfo {
+// disambiguate picks, among several matched candidates, the one with the
+// fewest extra columns and then the closest row count.
+func disambiguate(orig *TableInfo, candidates []*TableInfo) *TableInfo {
 	if len(candidates) == 0 {
 		return nil
 	}
 	best := candidates[0]
-	bestDiff := int(math.Abs(float64(orig.RowCount - best.RowCount)))
 	for _, c := range candidates[1:] {
-		diff := int(math.Abs(float64(orig.RowCount - c.RowCount)))
-		if diff < bestDiff {
+		if c.ColumnCount < best.ColumnCount ||
+			(c.ColumnCount == best.ColumnCount && absDiff(orig.RowCount, c.RowCount) < absDiff(orig.RowCount, best.RowCount)) {
 			best = c
-			bestDiff = diff
 		}
 	}
 	return best
 }
 
-// tryMultisetMatch computes Jaccard similarity on value frequency maps.
-func tryMultisetMatch(orig *TableInfo, candidates []*TableInfo, hashDB *sql.DB) (*TableInfo, float64) {
+func absDiff(a, b int) int {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// tryMultisetMatch scores candidates on value frequency maps of the first 10
+// rows: Jaccard similarity for candidates with the same column count, and the
+// share of original values found in the candidate for wider ones.
+func tryMultisetMatch(orig *TableInfo, candidates []*TableInfo) (*TableInfo, float64) {
 	origMultiset := buildMultiset(orig.FirstNRows, 10)
 
 	var bestCandidate *TableInfo
@@ -317,7 +387,12 @@ func tryMultisetMatch(orig *TableInfo, candidates []*TableInfo, hashDB *sql.DB) 
 
 	for _, c := range candidates {
 		candMultiset := buildMultiset(c.FirstNRows, 10)
-		score := jaccardSimilarity(origMultiset, candMultiset)
+		var score float64
+		if c.ColumnCount == orig.ColumnCount {
+			score = jaccardSimilarity(origMultiset, candMultiset)
+		} else {
+			score = containmentScore(origMultiset, candMultiset)
+		}
 		if score > bestScore {
 			bestScore = score
 			bestCandidate = c
@@ -377,6 +452,24 @@ func jaccardSimilarity(a, b map[string]int) float64 {
 	return float64(intersection) / float64(union)
 }
 
+// containmentScore computes the share of values of multiset a that also occur in b.
+func containmentScore(a, b map[string]int) float64 {
+	total := 0
+	contained := 0
+	for k, av := range a {
+		total += av
+		if bv := b[k]; bv < av {
+			contained += bv
+		} else {
+			contained += av
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(contained) / float64(total)
+}
+
 // tryFingerprintMatch uses distinctive values from the original table to find matches.
 func tryFingerprintMatch(orig *TableInfo, candidates []*TableInfo, origDB, hashDB *sql.DB) *TableInfo {
 	// Fetch up to 50 rows from original
@@ -432,7 +525,8 @@ func tryFingerprintMatch(orig *TableInfo, candidates []*TableInfo, origDB, hashD
 type ColumnInfo struct {
 	Name    string
 	Type    string // INTEGER, REAL, TEXT, etc.
-	PKIndex int    // 0 = not PK, 1+ = composite PK position
+	NotNull bool
+	PKIndex int // 0 = not PK, 1+ = composite PK position
 }
 
 // getColumnInfo returns full column metadata from PRAGMA table_info.
@@ -454,13 +548,21 @@ func getColumnInfo(db *sql.DB, tableName string) []ColumnInfo {
 		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
 			log.Fatalf("Error scanning PRAGMA table_info for %s: %v", tableName, err)
 		}
-		infos = append(infos, ColumnInfo{Name: name, Type: strings.ToUpper(colType), PKIndex: pk})
+		infos = append(infos, ColumnInfo{Name: name, Type: strings.ToUpper(colType), NotNull: notNull != 0, PKIndex: pk})
 	}
 	return infos
 }
 
+// columnMapping is the result of inferColumnMapping.
+type columnMapping struct {
+	Mapping     []int // Mapping[origIdx] = hashedIdx
+	Extra       []int // hashed columns without an original counterpart, in hashed column order
+	AlignedRows int   // original rows that were paired with a hashed row
+}
+
 // inferColumnMapping determines which hashed column maps to which original column.
-// Returns a slice where result[origIdx] = hashedIdx.
+// The hashed table may have more columns than the original one (the game added
+// columns to it); those are reported as Extra.
 //
 // Rows of the two tables are aligned first (joined on primary key values when a
 // usable PK exists, positionally otherwise), then columns are matched on their
@@ -468,27 +570,23 @@ func getColumnInfo(db *sql.DB, tableName string) []ColumnInfo {
 // fixed-size prefix matters: many columns are identical for the first few
 // hundred rows and only diverge later, so a prefix sample assigns them
 // arbitrarily and scrambles the copied data.
-func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []int {
+func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) columnMapping {
 	origInfo := getColumnInfo(origDB, origTable)
 	hashInfo := getColumnInfo(hashDB, hashTable)
 
 	origColCount := len(origInfo)
 	hashColCount := len(hashInfo)
 
-	if origColCount != hashColCount {
-		mapping := make([]int, origColCount)
-		for i := range mapping {
-			mapping[i] = i
-		}
-		return mapping
+	if hashColCount < origColCount {
+		log.Fatalf("Error mapping columns of %s: hashed table %s has %d columns, the original has %d",
+			origTable, hashTable, hashColCount, origColCount)
 	}
 
-	colCount := origColCount
-	mapping := make([]int, colCount)
+	mapping := make([]int, origColCount)
 	for i := range mapping {
 		mapping[i] = -1
 	}
-	usedHash := make([]bool, colCount)
+	usedHash := make([]bool, hashColCount)
 
 	// Pass 0: Match PRIMARY KEY columns by pk number (not position)
 	origPKByNum := make(map[int]int) // pk_number -> column_index
@@ -504,7 +602,7 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 		}
 	}
 	var pkPairs [][2]int // (origIdx, hashIdx) per PK column, ordered by pk number
-	for pkNum := 1; pkNum <= colCount; pkNum++ {
+	for pkNum := 1; pkNum <= hashColCount; pkNum++ {
 		origIdx, okOrig := origPKByNum[pkNum]
 		hashIdx, okHash := hashPKByNum[pkNum]
 		if okOrig && okHash {
@@ -520,8 +618,8 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 	hashRows := getAllRows(hashDB, hashTable)
 	origAligned, hashAligned := alignRows(origRows, hashRows, pkPairs, pkUsable)
 
-	origCols := buildColumnVectors(origAligned, colCount)
-	hashCols := buildColumnVectors(hashAligned, colCount)
+	origCols := buildColumnVectors(origAligned, origColCount)
+	hashCols := buildColumnVectors(hashAligned, hashColCount)
 
 	// Pass 1: exact vector equality, grouped by (type, vector digest). Columns
 	// inside one group hold identical values on every aligned row, so pairing
@@ -532,13 +630,13 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 	}
 	origGroups := make(map[colGroup][]int)
 	hashGroups := make(map[colGroup][]int)
-	for i := 0; i < colCount; i++ {
+	for i := 0; i < origColCount; i++ {
 		if mapping[i] == -1 {
 			key := colGroup{origInfo[i].Type, hashVector(origCols[i])}
 			origGroups[key] = append(origGroups[key], i)
 		}
 	}
-	for j := 0; j < colCount; j++ {
+	for j := 0; j < hashColCount; j++ {
 		if !usedHash[j] {
 			key := colGroup{hashInfo[j].Type, hashVector(hashCols[j])}
 			hashGroups[key] = append(hashGroups[key], j)
@@ -571,11 +669,11 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 			origIdx, hashIdx, mismatches int
 		}
 		var pairs []colPair
-		for i := 0; i < colCount; i++ {
+		for i := 0; i < origColCount; i++ {
 			if mapping[i] != -1 {
 				continue
 			}
-			for j := 0; j < colCount; j++ {
+			for j := 0; j < hashColCount; j++ {
 				if usedHash[j] {
 					continue
 				}
@@ -606,7 +704,7 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 	// Final fallback: any still unmapped
 	for i := range mapping {
 		if mapping[i] == -1 {
-			for j := 0; j < colCount; j++ {
+			for j := 0; j < hashColCount; j++ {
 				if !usedHash[j] {
 					mapping[i] = j
 					usedHash[j] = true
@@ -616,14 +714,21 @@ func inferColumnMapping(origDB, hashDB *sql.DB, origTable, hashTable string) []i
 		}
 	}
 
-	return mapping
+	var extra []int
+	for j := 0; j < hashColCount; j++ {
+		if !usedHash[j] {
+			extra = append(extra, j)
+		}
+	}
+
+	return columnMapping{Mapping: mapping, Extra: extra, AlignedRows: len(origAligned)}
 }
 
 // alignRows pairs rows of the original and hashed tables so their columns can
 // be compared value-by-value. When a usable primary key exists, rows are
 // joined on their PK values; a positional pairing (keeping only positions
-// where both rows hold the same multiset of values) is the fallback, and wins
-// whenever it aligns more rows than the PK join managed.
+// where the hashed row holds every value of the original row) is the
+// fallback, and wins whenever it aligns more rows than the PK join managed.
 func alignRows(origRows, hashRows [][]string, pkPairs [][2]int, pkUsable bool) ([][]string, [][]string) {
 	var origByPK, hashByPK [][]string
 	if pkUsable {
@@ -654,7 +759,7 @@ func alignRows(origRows, hashRows [][]string, pkPairs [][2]int, pkUsable bool) (
 		sortedHash := make([]string, len(hashRows[i]))
 		copy(sortedHash, hashRows[i])
 		sort.Strings(sortedHash)
-		if strSliceEqual(sortedOrig, sortedHash) {
+		if sortedRowContains(sortedHash, sortedOrig) {
 			origByPos = append(origByPos, origRows[i])
 			hashByPos = append(hashByPos, hashRows[i])
 		}
@@ -718,25 +823,39 @@ func buildColumnVectors(rows [][]string, colCount int) [][]string {
 	return cols
 }
 
-func copyData(originalDB, hashedDB, newDB *sql.DB, origTable, hashedTable string, colMapping []int) {
+// copyData creates origTable in the new DB with the original schema (plus any
+// column the game added, appended under its hashed name) and fills it from
+// the hashed table with columns reordered per the mapping.
+func copyData(originalDB, hashedDB, newDB *sql.DB, origTable, hashedTable string, columns columnMapping) {
 	createStmt, err := getCreateTableStatement(originalDB, origTable)
 	if err != nil {
 		log.Fatalf("Error getting CREATE TABLE statement for table %s: %v", origTable, err)
 	}
 
-	_, err = newDB.Exec(createStmt)
+	hashInfo := getColumnInfo(hashedDB, hashedTable)
+	extraInfo := make([]ColumnInfo, 0, len(columns.Extra))
+	for _, j := range columns.Extra {
+		if hashInfo[j].PKIndex > 0 {
+			log.Printf("[warn] %s: new column %s is part of the hashed table's primary key; the original key is kept",
+				origTable, hashInfo[j].Name)
+		}
+		extraInfo = append(extraInfo, hashInfo[j])
+	}
+
+	_, err = newDB.Exec(appendColumns(createStmt, extraInfo))
 	if err != nil {
 		log.Fatalf("Error creating table %s in new database: %v", origTable, err)
 	}
 
-	hashCols := getColumnNames(hashedDB, hashedTable)
-	selectCols := make([]string, len(colMapping))
-	for origIdx, hashIdx := range colMapping {
-		if hashIdx >= 0 && hashIdx < len(hashCols) {
-			selectCols[origIdx] = fmt.Sprintf("[%s]", hashCols[hashIdx])
-		} else {
-			selectCols[origIdx] = fmt.Sprintf("[%s]", hashCols[origIdx])
+	selectCols := make([]string, 0, len(columns.Mapping)+len(columns.Extra))
+	for origIdx, hashIdx := range columns.Mapping {
+		if hashIdx < 0 || hashIdx >= len(hashInfo) {
+			hashIdx = origIdx
 		}
+		selectCols = append(selectCols, fmt.Sprintf("[%s]", hashInfo[hashIdx].Name))
+	}
+	for _, j := range columns.Extra {
+		selectCols = append(selectCols, fmt.Sprintf("[%s]", hashInfo[j].Name))
 	}
 	query := fmt.Sprintf("SELECT %s FROM [%s]", strings.Join(selectCols, ", "), hashedTable)
 
@@ -794,6 +913,29 @@ func copyData(originalDB, hashedDB, newDB *sql.DB, origTable, hashedTable string
 	}
 }
 
+// appendColumns adds column definitions to a CREATE TABLE statement, after the
+// existing columns and before the table's PRIMARY KEY constraint.
+func appendColumns(createStmt string, extra []ColumnInfo) string {
+	if len(extra) == 0 {
+		return createStmt
+	}
+	defs := make([]string, len(extra))
+	for i, c := range extra {
+		defs[i] = fmt.Sprintf("'%s' %s", c.Name, c.Type)
+		if c.NotNull {
+			defs[i] += " NOT NULL"
+		}
+	}
+	at := strings.LastIndex(createStmt, ", PRIMARY KEY")
+	if at < 0 {
+		at = strings.LastIndex(createStmt, ")")
+	}
+	if at < 0 {
+		log.Fatalf("Error appending columns: cannot parse CREATE TABLE statement %q", createStmt)
+	}
+	return createStmt[:at] + ", " + strings.Join(defs, ", ") + createStmt[at:]
+}
+
 func copyEmptyTable(originalDB, newDB *sql.DB, origTable string) {
 	createStmt, err := getCreateTableStatement(originalDB, origTable)
 	if err != nil {
@@ -846,29 +988,6 @@ func getColumnCount(db *sql.DB, tableName string) int {
 		count++
 	}
 	return count
-}
-
-func getColumnNames(db *sql.DB, tableName string) []string {
-	query := fmt.Sprintf("PRAGMA table_info([%s])", tableName)
-	rows, err := db.Query(query)
-	if err != nil {
-		log.Fatalf("Error getting column names for table %s: %v", tableName, err)
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull int
-		var dfltValue *string
-		var pk int
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			log.Fatalf("Error scanning PRAGMA table_info for %s: %v", tableName, err)
-		}
-		names = append(names, name)
-	}
-	return names
 }
 
 func getFirstNRows(db *sql.DB, tableName string, n int) [][]string {
